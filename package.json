@@ -1,0 +1,34 @@
+{
+  "name": "synapse-cli",
+  "version": "0.2.0",
+  "description": "Thin client for the Synapse organizational-memory API — bind a repo to an agent identity, run OKR-bound workflows, and report work (checkins, facts, learnings, artifacts) back to Synapse.",
+  "bin": {
+    "synapse-cli": "bin/synapse-cli"
+  },
+  "files": [
+    "bin/",
+    "README.md",
+    "LICENSE"
+  ],
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "keywords": [
+    "synapse",
+    "agents",
+    "okr",
+    "org-memory",
+    "cli"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dp-pcs/synapse-cli.git"
+  },
+  "homepage": "https://github.com/dp-pcs/synapse-cli#readme",
+  "bugs": {
+    "url": "https://github.com/dp-pcs/synapse-cli/issues"
+  },
+  "author": "David Proctor",
+  "license": "MIT"
+}

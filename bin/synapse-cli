@@ -1,0 +1,1092 @@
+#!/usr/bin/env python3
+"""
+synapse-cli — thin client for the Synapse organizational memory API.
+
+Resolves (agent, project, token) bindings from .agent/synapse.yaml in the current
+working directory, falling back to ~/.config/synapse/registry.yaml. Tokens come
+from macOS Keychain by convention: `synapse-<agent-slug>`.
+
+Subcommands:
+    session-start    Read binding, create workflow run, fetch+ack briefs, print env exports
+    session-end      Close the active workflow run with checkin status complete|failed
+    intent           Call any intent by name with a JSON payload (generic escape hatch)
+    bind             Print the resolved binding for the current directory
+    redeem           Redeem an enrollment code, store token in Keychain
+    keychain         Read/write Keychain entries (subcommand: get|set|list)
+    doctor           Run end-to-end sanity check
+
+Auth model (per Synapse /docs §1):
+    Each agent has ONE token. The token authenticates as the agent; project access
+    is determined by primary_team_id (implicit, granted at enrollment based on the
+    project's team) or project_agents membership (explicit). One token works across
+    all projects governed by the agent's primary team.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import mimetypes
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from typing import Any
+
+try:
+    import yaml  # optional fast-path; not required
+except ImportError:
+    yaml = None
+
+DEFAULT_SYNAPSE_URL = "https://cnu.synapse-os.ai"
+REGISTRY_PATH = pathlib.Path.home() / ".config" / "synapse" / "registry.yaml"
+SESSION_STATE_DIR = pathlib.Path.home() / ".cache" / "synapse"
+SESSION_STATE_FILE = SESSION_STATE_DIR / "current-session.json"
+# Backend-agnostic token resolvers (credential-helper pattern). Each file is an
+# executable that prints the agent's token to stdout — so Keychain, 1Password,
+# pass, secret-tool, a plain file, or any custom command all work the same way.
+RESOLVER_DIR = pathlib.Path.home() / ".config" / "synapse" / "resolvers"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# YAML parsing — uses PyYAML
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _parse_yaml(text: str) -> dict:
+    if yaml is not None:
+        return yaml.safe_load(text) or {}
+    return _parse_yaml_fallback(text)
+
+
+def _parse_yaml_fallback(text: str) -> dict:
+    """Minimal parser for the flat .agent/synapse.yaml shape (scalars + simple
+    string lists). Keeps the CLI dependency-free so `npx`/`npm` installs need only
+    python3 — no pip step. NOT a general YAML parser; it covers our binding +
+    registry files (top-level `key: value`, a `key:` followed by `- item` lines,
+    and inline empty `key: []`)."""
+    data: dict = {}
+    cur_list_key = None
+    for raw in text.splitlines():
+        line = (raw.split(" #", 1)[0] if " #" in raw else raw).rstrip()
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        m_item = re.match(r"\s*-\s+(.*)$", line)
+        if m_item is not None and cur_list_key is not None:
+            data.setdefault(cur_list_key, []).append(m_item.group(1).strip().strip("\"'"))
+            continue
+        m_kv = re.match(r"([A-Za-z0-9_]+):\s*(.*)$", line)
+        if m_kv is not None:
+            key, val = m_kv.group(1), m_kv.group(2).strip()
+            if val == "":
+                cur_list_key = key
+                data.setdefault(key, [])
+            elif val in ("[]", "[ ]"):
+                data[key] = []
+                cur_list_key = None
+            else:
+                data[key] = val.strip("\"'")
+                cur_list_key = None
+    return data
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Keychain helpers (macOS `security` command)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def keychain_get(name: str) -> str | None:
+    try:
+        out = subprocess.check_output(
+            ["security", "find-generic-password", "-s", name, "-w"],
+            stderr=subprocess.DEVNULL,
+        )
+        return out.decode().strip()
+    except subprocess.CalledProcessError:
+        return None
+
+
+def keychain_set(name: str, value: str, account: str = "synapse") -> None:
+    # -U updates if exists, otherwise creates
+    subprocess.check_call([
+        "security", "add-generic-password",
+        "-s", name,
+        "-a", account,
+        "-w", value,
+        "-U",
+    ])
+
+
+def keychain_list_synapse() -> list[str]:
+    """List Keychain entries Synapse-related: `synapse-*` OR `*_SYNAPSE_TOKEN`."""
+    try:
+        out = subprocess.check_output(["security", "dump-keychain"], stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        return []
+    names: set[str] = set()
+    for line in out.decode(errors="ignore").splitlines():
+        m = re.search(r'"svce"<blob>="((?:synapse-[^"]+)|(?:[A-Z_]+_SYNAPSE_TOKEN))"', line)
+        if m:
+            names.add(m.group(1))
+    return sorted(names)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Binding resolution
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class Binding:
+    project_id: str
+    team_id: str | None
+    agent_id: str
+    token: str
+    synapse_url: str
+    source: str  # human-readable origin (path)
+
+
+def _slug(qualified: str) -> str:
+    """`project.signal` → `signal`, `agent.signal-junior` → `signal-junior`."""
+    return qualified.split(".", 1)[1] if "." in qualified else qualified
+
+
+def keychain_entry_for(agent_id: str, project_id: str | None = None) -> str:
+    """Keychain entry name for an agent's token.
+
+    Auth model: each agent has ONE token. The token authenticates as the agent;
+    project access is determined by the agent's primary_team_id (implicit) or
+    project_agents membership (explicit), NOT by the token itself. So one
+    Keychain entry per agent_id is correct.
+
+    The `project_id` arg is kept for backward compat with the older naming
+    convention (`synapse-<agent>-<project>`); the lookup falls back to that
+    form if the new entry is missing.
+    """
+    return f"synapse-{_slug(agent_id)}"
+
+
+def legacy_keychain_entry_for(agent_id: str, project_id: str) -> str:
+    """Old per-(agent, project) Keychain convention. Tried as fallback."""
+    return f"synapse-{_slug(agent_id)}-{_slug(project_id)}"
+
+
+def resolve_token_via_command(agent_id: str) -> str | None:
+    """Run the user-registered resolver for this agent, if any.
+
+    A resolver is an executable at ~/.config/synapse/resolvers/<agent-slug> that
+    prints the token to stdout. This is the backend-agnostic path: macOS Keychain,
+    Linux secret-tool, 1Password (`op read`), pass, a 0600 file, or any custom
+    command all reduce to "a command that emits the token." Highest priority so
+    the user's explicit storage choice always wins over built-in defaults.
+    """
+    f = RESOLVER_DIR / _slug(agent_id)
+    if f.is_file() and os.access(f, os.X_OK):
+        try:
+            out = subprocess.check_output([str(f)], stderr=subprocess.DEVNULL, timeout=20)
+            tok = out.decode().strip()
+            return tok or None
+        except Exception:
+            return None
+    return None
+
+
+def find_binding(cwd: pathlib.Path) -> Binding:
+    """Walk up from cwd looking for .agent/synapse.yaml; fall back to registry."""
+    cur = cwd.resolve()
+    while True:
+        candidate = cur / ".agent" / "synapse.yaml"
+        if candidate.is_file():
+            cfg = _parse_yaml(candidate.read_text())
+            return _binding_from_cfg(cfg, str(candidate))
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+
+    # Fallback: lookup by path in registry
+    if REGISTRY_PATH.is_file():
+        registry = _parse_yaml(REGISTRY_PATH.read_text())
+        for entry in registry.get("repos", []) or []:
+            path = entry.get("path", "").replace("~", str(pathlib.Path.home()))
+            if cwd.resolve() == pathlib.Path(path).resolve() or str(cwd).startswith(path):
+                return _binding_from_cfg(entry, str(REGISTRY_PATH))
+
+    raise SystemExit(
+        f"no .agent/synapse.yaml found walking up from {cwd}, "
+        f"and {REGISTRY_PATH} has no matching entry. "
+        f"Run `synapse-cli bind --init` to scaffold one."
+    )
+
+
+def _binding_from_cfg(cfg: dict, source: str) -> Binding:
+    project_id = cfg.get("project_id") or cfg.get("project")
+    if not project_id:
+        raise SystemExit(f"{source}: missing required key `project_id`")
+
+    agents = cfg.get("agents") or ([cfg["agent"]] if cfg.get("agent") else [])
+    if not agents:
+        raise SystemExit(f"{source}: missing `agents:` list (preferred agent identities in order)")
+
+    synapse_url = cfg.get("synapse_url") or os.environ.get("SYNAPSE_URL") or DEFAULT_SYNAPSE_URL
+    team_id = cfg.get("team_id")
+
+    # Lookup order:
+    #   1. New per-agent convention: synapse-<agent-slug>
+    #   2. Older per-(agent,project): synapse-<agent-slug>-<project-slug>
+    #   3. David's existing legacy convention: <PROJECT_SLUG>_SYNAPSE_TOKEN (Keychain)
+    #   4. Env var: <PROJECT_SLUG>_SYNAPSE_TOKEN
+    #   5. Env var: $SYNAPSE_TOKEN
+    tried = []
+    for agent_id in agents:
+        # 0. User-registered resolver (backend-agnostic — wins over built-in defaults)
+        token = resolve_token_via_command(agent_id)
+        if token:
+            return Binding(
+                project_id=project_id, team_id=team_id, agent_id=agent_id,
+                token=token, synapse_url=synapse_url,
+                source=f"{source} (resolver: ~/.config/synapse/resolvers/{_slug(agent_id)})",
+            )
+        # 1-2. Built-in macOS Keychain conventions (new, then legacy per-project)
+        for entry in (keychain_entry_for(agent_id), legacy_keychain_entry_for(agent_id, project_id)):
+            token = keychain_get(entry)
+            if token:
+                return Binding(
+                    project_id=project_id, team_id=team_id, agent_id=agent_id,
+                    token=token, synapse_url=synapse_url, source=source,
+                )
+            tried.append(f"  {agent_id:30s} → keychain miss: `{entry}`")
+
+    # Project-scoped legacy convention (David's existing Keychain entries from
+    # the clawd-signal era: SIGNAL_SYNAPSE_TOKEN, ENTROPY_SYNAPSE_TOKEN, etc.)
+    project_token_name = f"{_slug(project_id).upper().replace('-', '_')}_SYNAPSE_TOKEN"
+    token = keychain_get(project_token_name)
+    if token:
+        return Binding(
+            project_id=project_id, team_id=team_id, agent_id=agents[0],
+            token=token, synapse_url=synapse_url,
+            source=f"{source} (Keychain: {project_token_name})",
+        )
+    tried.append(f"  project-legacy           → keychain miss: `{project_token_name}`")
+
+    # Env var fallbacks
+    if os.environ.get(project_token_name):
+        return Binding(
+            project_id=project_id, team_id=team_id, agent_id=agents[0],
+            token=os.environ[project_token_name], synapse_url=synapse_url,
+            source=f"{source} (env: ${project_token_name})",
+        )
+    if os.environ.get("SYNAPSE_TOKEN"):
+        return Binding(
+            project_id=project_id, team_id=team_id, agent_id=agents[0],
+            token=os.environ["SYNAPSE_TOKEN"], synapse_url=synapse_url,
+            source=f"{source} (env: $SYNAPSE_TOKEN)",
+        )
+
+    raise SystemExit(
+        f"no token found for {project_id}. Tried (in order):\n"
+        + "\n".join(tried)
+        + f"\n  env: ${project_token_name}\n  env: $SYNAPSE_TOKEN\n"
+        f"Run `synapse-cli redeem <enr_code> --display-name <name> --project {project_id}` to mint."
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTTP — every Synapse intent is POST /v1/intent/<name>
+# ─────────────────────────────────────────────────────────────────────────────
+
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+
+def call_intent(b: Binding, intent: str, payload: dict | None = None, *, retries: int = 3) -> dict:
+    """POST an intent. Maps HTTP status to the runbook's prescribed responses
+    (401 re-enroll, 403 scope, 400 field_errors) and retries 429/5xx with backoff."""
+    url = f"{b.synapse_url.rstrip('/')}/v1/intent/{intent}"
+    body = json.dumps(payload or {}).encode()
+    attempt = 0
+    while True:
+        req = urllib.request.Request(
+            url, data=body, method="POST",
+            headers={
+                "authorization": f"Bearer {b.token}",
+                "content-type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                status, raw = resp.status, resp.read()
+        except urllib.error.HTTPError as e:
+            status, raw = e.code, e.read()
+        except urllib.error.URLError as e:
+            if attempt < retries:
+                time.sleep(min(2 ** attempt, 30)); attempt += 1; continue
+            raise SystemExit(f"{intent}: network error after {retries} retries: {e}")
+
+        if status in RETRYABLE_STATUS and attempt < retries:
+            time.sleep(min(2 ** attempt, 30)); attempt += 1; continue
+
+        try:
+            envelope = json.loads(raw)
+        except json.JSONDecodeError:
+            raise SystemExit(f"{intent}: non-JSON {status} response: {raw[:200]!r}")
+
+        if status == 401:
+            raise SystemExit(
+                f"{intent}: 401 — token invalid or revoked for {b.agent_id}.\n"
+                f"Re-enroll: synapse-cli redeem <enr_code_…> --display-name <name>"
+            )
+        if status == 403:
+            raise SystemExit(
+                f"{intent}: 403 — {b.agent_id} lacks the scope for this intent.\n"
+                f"Ask your operator for it (e.g. synapse-cli question --subject 'need scope for {intent}' "
+                f"--body '...'), or check the agent's enrollment bundle. Do not retry until granted."
+            )
+        if status == 400:
+            detail = envelope.get("detail")
+            fe = detail.get("field_errors") if isinstance(detail, dict) else None
+            raise SystemExit(
+                f"{intent}: 400 — schema validation failed. Fix the payload (do not retry unchanged):\n"
+                f"{json.dumps(fe or detail, indent=2)}"
+            )
+        if status in RETRYABLE_STATUS:
+            raise SystemExit(f"{intent}: {status} after {retries} retries. On persistent platform "
+                             f"failure, file synapse-cli feedback (category platform-bug).")
+        if not envelope.get("ok"):
+            raise SystemExit(
+                f"{intent} failed: {envelope.get('error')}\n"
+                f"detail: {json.dumps(envelope.get('detail'), indent=2)}"
+            )
+        return envelope.get("data") or {}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Session state — survives across hook invocations within one shell session
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_session() -> dict | None:
+    if not SESSION_STATE_FILE.is_file():
+        return None
+    try:
+        return json.loads(SESSION_STATE_FILE.read_text())
+    except json.JSONDecodeError:
+        return None
+
+
+def _save_session(state: dict) -> None:
+    SESSION_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    SESSION_STATE_FILE.write_text(json.dumps(state, indent=2))
+
+
+def _clear_session() -> None:
+    if SESSION_STATE_FILE.is_file():
+        SESSION_STATE_FILE.unlink()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Subcommand implementations
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _resolve_objective(args, active_okrs: list) -> str | None:
+    """Pick the objective_id this run's workflow binds to.
+
+    The live manifest REQUIRES target_objective_id on workflow.create: it is
+    rejected on okrs_required projects without it, and work doesn't roll up to
+    OKRs anywhere without it. Precedence: explicit --objective > the project's
+    sole active OKR (auto-pick) > error on ambiguity (>1) > warn on none.
+    """
+    explicit = getattr(args, "objective", None)
+    if explicit:
+        return explicit
+    okrs = [o for o in (active_okrs or []) if isinstance(o, dict) and o.get("id")]
+    if len(okrs) == 1:
+        return okrs[0]["id"]
+    if len(okrs) > 1:
+        listing = "\n".join(f"     {o['id']}  {o.get('title', '')}" for o in okrs)
+        raise SystemExit(
+            "multiple active OKRs for this project — pass --objective <id>:\n" + listing
+        )
+    # No active OKR surfaced. okrs_required projects will reject the workflow;
+    # elsewhere it just won't roll up. Warn loudly, proceed unbound.
+    print("⚠️  no active OKR for this project — workflow won't roll up, and will be "
+          "REJECTED if the project is okrs_required. Publish an objective or pass "
+          "--objective <id>.", file=sys.stderr)
+    return None
+
+
+def cmd_session_start(args) -> int:
+    b = find_binding(pathlib.Path.cwd())
+
+    # 1. Fetch & ack briefs; capture active OKRs (brief.fetch → {briefs, active_okrs})
+    briefs_data = call_intent(b, "synapse.brief.fetch", {"project_id": b.project_id})
+    briefs = briefs_data.get("briefs", []) if isinstance(briefs_data, dict) else []
+    active_okrs = briefs_data.get("active_okrs", []) if isinstance(briefs_data, dict) else []
+    for brief in briefs:
+        bid = brief.get("id")
+        if not bid:
+            continue
+        # Display briefly to stderr so the agent (and human) see what they're acking
+        print(f"📬 brief: {brief.get('title', '<no title>')}", file=sys.stderr)
+        call_intent(b, "synapse.brief.ack", {"brief_id": bid})
+
+    # 2. Resolve the OKR this run binds to (see _resolve_objective for the contract)
+    target_objective_id = _resolve_objective(args, active_okrs)
+
+    # 3. Create workflow run, bound to the objective when we have one
+    title = args.title or f"session @ {pathlib.Path.cwd().name}"
+    wf_payload = {
+        "project_id": b.project_id,
+        "workflow_class": args.workflow_class,
+        "title": title,
+    }
+    if target_objective_id:
+        wf_payload["target_objective_id"] = target_objective_id
+    workflow = call_intent(b, "synapse.workflow.create", wf_payload)
+    bd_id = workflow.get("bd_id")
+    if not bd_id:
+        raise SystemExit(f"workflow.create returned no bd_id: {workflow}")
+
+    # 4. Persist session state (incl. objective so checkins/close reuse it) + env exports
+    state = {
+        "bd_id": bd_id,
+        "project_id": b.project_id,
+        "agent_id": b.agent_id,
+        "team_id": b.team_id,
+        "synapse_url": b.synapse_url,
+        "target_objective_id": target_objective_id,
+        "cwd": str(pathlib.Path.cwd()),
+    }
+    _save_session(state)
+
+    if args.print_env:
+        # Hooks `eval` this output to inject env into the shell
+        print(f'export SYNAPSE_BD_ID="{bd_id}"')
+        print(f'export SYNAPSE_PROJECT_ID="{b.project_id}"')
+        print(f'export SYNAPSE_AGENT="{b.agent_id}"')
+        print(f'export SYNAPSE_URL="{b.synapse_url}"')
+        print(f'export SYNAPSE_TOKEN="{b.token}"')
+
+    print(f"🧠 Synapse: bound to {b.agent_id} on {b.project_id} → {bd_id}", file=sys.stderr)
+    if target_objective_id:
+        print(f"   ↳ objective: {target_objective_id}", file=sys.stderr)
+    if briefs:
+        print(f"   acked {len(briefs)} brief(s)", file=sys.stderr)
+    return 0
+
+
+def cmd_session_end(args) -> int:
+    state = _load_session()
+    if not state:
+        print("synapse: no active session to close", file=sys.stderr)
+        return 0
+    # Resolve token: new convention first, legacy fallback
+    token = (
+        keychain_get(keychain_entry_for(state["agent_id"]))
+        or keychain_get(legacy_keychain_entry_for(state["agent_id"], state["project_id"]))
+        or ""
+    )
+    b = Binding(
+        project_id=state["project_id"], team_id=state.get("team_id"),
+        agent_id=state["agent_id"], token=token,
+        synapse_url=state["synapse_url"], source="session-state",
+    )
+    if not b.token:
+        # Token may have been rotated between start and end; warn but don't fail
+        print(f"synapse: token missing for {b.agent_id}/{b.project_id}; cannot close", file=sys.stderr)
+        _clear_session()
+        return 1
+
+    checkin_payload = {
+        "project_id": b.project_id,
+        "bd_id": state["bd_id"],
+        "status": args.status,
+        "current_task": args.note or f"session ended ({args.status})",
+    }
+    if state.get("target_objective_id"):
+        checkin_payload["target_objective_id"] = state["target_objective_id"]
+    call_intent(b, "synapse.checkin", checkin_payload)
+    _clear_session()
+    print(f"🧠 Synapse: closed {state['bd_id']} as {args.status}", file=sys.stderr)
+    return 0
+
+
+# Intents that do NOT accept a project_id: they create/define the project itself,
+# so there is no project to scope to yet. Their request schemas set
+# additionalProperties:false (72/110 intents do), so auto-injecting project_id
+# would trigger a 400 validation error rather than the real auth result.
+INTENTS_WITHOUT_PROJECT_ID = {
+    "synapse.project.create",
+    "synapse.project.request",
+}
+
+# Intents that accept target_objective_id — thread the active run's objective into
+# these (and ONLY these; most intents are additionalProperties:false and a stray
+# field would 400 rather than do the intended thing).
+OBJECTIVE_THREADING_INTENTS = {
+    "synapse.checkin",
+    "synapse.workflow.create",
+}
+
+
+def cmd_intent(args) -> int:
+    b = find_binding(pathlib.Path.cwd())
+    payload = json.loads(args.payload) if args.payload else {}
+    # Auto-thread project_id unless suppressed or the intent doesn't take one.
+    if not args.no_thread_project and args.name not in INTENTS_WITHOUT_PROJECT_ID:
+        payload.setdefault("project_id", b.project_id)
+    state = _load_session()
+    if state and "bd_id" not in payload and not args.no_thread_bd:
+        payload["bd_id"] = state["bd_id"]
+    # Thread the active run's objective into intents that accept it (guarded set above)
+    if (state and state.get("target_objective_id")
+            and args.name in OBJECTIVE_THREADING_INTENTS
+            and "target_objective_id" not in payload):
+        payload["target_objective_id"] = state["target_objective_id"]
+    result = call_intent(b, args.name, payload)
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+BINDING_TEMPLATE = """\
+# {repo}/.agent/synapse.yaml — declares this repo's Synapse binding.
+# Tokens are NEVER stored here; only the identity declaration. Commit-safe.
+project_id: {project_id}
+team_id: {team_id}
+synapse_url: {synapse_url}
+
+# Agent identity preference order. The CLI tries each until it finds a token
+# (resolver → Keychain synapse-<agent-slug> → legacy fallbacks). First hit wins.
+agents:
+{agents_block}
+# What kinds of work in this repo are worth logging to Synapse.
+reportable:
+  - artifact_produced
+  - decision_made
+  - kr_advanced
+  - commit_pushed
+
+# Optional: which org objectives this repo's work tends to serve.
+objective_hints: []
+"""
+
+
+def _qualify(value: str, prefix: str) -> str:
+    """Ensure a value carries its qualifier: 'signal' → 'project.signal'."""
+    value = value.strip()
+    return value if value.startswith(prefix + ".") else f"{prefix}.{value}"
+
+
+def _bind_init(args) -> int:
+    """Scaffold .agent/synapse.yaml in the current repo (the command find_binding
+    advertises). Takes --project/--team/--agent, prompts for anything missing,
+    and refuses to clobber an existing binding unless --force."""
+    target = pathlib.Path.cwd() / ".agent" / "synapse.yaml"
+    if target.exists() and not args.force:
+        print(f"refusing to overwrite existing {target}\n  (pass --force to replace)", file=sys.stderr)
+        return 1
+
+    def ask(prompt: str, default: str | None = None) -> str:
+        suffix = f" [{default}]" if default else ""
+        try:
+            ans = input(f"{prompt}{suffix}: ").strip()
+        except EOFError:
+            ans = ""
+        return ans or (default or "")
+
+    project = args.project or ask("project id (e.g. project.signal or just 'signal')")
+    if not project:
+        print("project id is required", file=sys.stderr)
+        return 1
+    project = _qualify(project, "project")
+
+    team = _qualify(args.team or ask("team id", "team.ai-coe"), "team")
+
+    agents = list(args.agent or [])
+    if not agents:
+        a = ask("agent id (e.g. agent.signal-junior or just 'signal-junior')")
+        if not a:
+            print("at least one agent id is required", file=sys.stderr)
+            return 1
+        agents = [a]
+    agents = [_qualify(a, "agent") for a in agents]
+
+    synapse_url = args.synapse_url or os.environ.get("SYNAPSE_URL") or DEFAULT_SYNAPSE_URL
+    agents_block = "".join(f"  - {a}\n" for a in agents)
+    content = BINDING_TEMPLATE.format(
+        repo=pathlib.Path.cwd().name,
+        project_id=project, team_id=team, synapse_url=synapse_url,
+        agents_block=agents_block,
+    )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content)
+    print(f"✅ wrote {target}")
+    print(f"   project={project}  team={team}  agents={agents}")
+    print(f"   verify with: synapse-cli doctor")
+    return 0
+
+
+def cmd_bind(args) -> int:
+    if getattr(args, "init", False):
+        return _bind_init(args)
+    try:
+        b = find_binding(pathlib.Path.cwd())
+    except SystemExit as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    print(json.dumps({
+        "project_id": b.project_id,
+        "team_id": b.team_id,
+        "agent_id": b.agent_id,
+        "synapse_url": b.synapse_url,
+        "keychain_entry": keychain_entry_for(b.agent_id),
+        "source": b.source,
+    }, indent=2))
+    return 0
+
+
+def cmd_redeem(args) -> int:
+    """Redeem an enrollment code via synapse.agent.enroll.
+
+    Payload shape (confirmed via Rahul's project-onboarding emails):
+        { "code": "<enr_code_...>",
+          "display_name": "<this-agent-name>",
+          "declared_capabilities": ["coder", "evaluator", ...] }
+
+    The enrollment code is project-scoped. The response includes a syn_… token
+    plus the agent_id Synapse assigned (usually `agent.<display_name>`).
+    """
+    if args.code.startswith("enr_") and not args.code.startswith("enr_code_"):
+        raise SystemExit(
+            "that looks like an enrollment RECORD id (enr_<hex>) from the members list — "
+            "it is NOT redeemable.\nUse the secret shown ONCE at mint time; it starts with "
+            "`enr_code_`."
+        )
+    payload: dict[str, Any] = {
+        "code": args.code,
+        "display_name": args.display_name,
+    }
+    if args.capabilities:
+        payload["declared_capabilities"] = args.capabilities
+
+    url = f"{DEFAULT_SYNAPSE_URL}/v1/intent/synapse.agent.enroll"
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode(), method="POST",
+        headers={"content-type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            envelope = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        envelope = json.loads(e.read())
+
+    if not envelope.get("ok"):
+        print(f"redemption failed: {envelope.get('error')}", file=sys.stderr)
+        print(f"detail: {json.dumps(envelope.get('detail'), indent=2)}", file=sys.stderr)
+        return 1
+
+    data = envelope.get("data", {})
+    # Response shape (confirmed 2026-05-19): data.api_token.raw is the Bearer.
+    # Also handle older / alternative shapes defensively.
+    api_token = data.get("api_token") or {}
+    token = (
+        api_token.get("raw")
+        or data.get("token")
+        or data.get("bearer")
+    )
+    agent_id = data.get("agent_id") or f"agent.{args.display_name}"
+    projects_added = data.get("project_ids_added") or []
+    project_id = projects_added[0] if projects_added else (data.get("project_id") or args.project)
+
+    if not token:
+        print(f"redemption returned no token: {envelope}", file=sys.stderr)
+        return 1
+
+    entry = keychain_entry_for(agent_id)
+    keychain_set(entry, token)
+    print(f"✅ token for {agent_id} stored at Keychain entry `{entry}`")
+    if api_token.get("id"):
+        print(f"   token_id: {api_token['id']}  (for revocation via synapse.enrollment.revoke)")
+    if projects_added:
+        print(f"   project_ids_added: {projects_added}")
+    scopes = data.get("scopes")
+    if scopes:
+        print(f"   scopes ({len(scopes)}): {', '.join(scopes)}")
+    return 0
+
+
+def cmd_keychain(args) -> int:
+    if args.action == "list":
+        for n in keychain_list_synapse():
+            print(n)
+        return 0
+    if args.action == "get":
+        v = keychain_get(args.name)
+        print(v or "")
+        return 0 if v else 1
+    if args.action == "set":
+        keychain_set(args.name, args.value)
+        print(f"✅ stored at {args.name}")
+        return 0
+    return 1
+
+
+def cmd_doctor(args) -> int:
+    print("🩺 synapse-cli doctor")
+    print()
+    print(f"1. cwd: {pathlib.Path.cwd()}")
+    try:
+        b = find_binding(pathlib.Path.cwd())
+        print(f"   ✅ binding: {b.agent_id} → {b.project_id}  (source: {b.source})")
+    except SystemExit as e:
+        print(f"   ❌ {e}")
+        return 1
+
+    canonical = keychain_entry_for(b.agent_id)
+    print(f"2. token: ✅ resolved ({len(b.token)} chars)")
+    src = b.source or ""
+    if "(Keychain:" in src or "(env:" in src:
+        origin = src[src.rfind("(") + 1 : src.rfind(")")]
+        print(f"   ⚠️  came from a FALLBACK ({origin}), NOT this agent's own `{canonical}`.")
+        print(f"      If that token is stale/revoked, enroll the agent so it has its own:")
+        print(f"      synapse-cli redeem <enr_code> --display-name {_slug(b.agent_id)}")
+    elif "(resolver:" in src:
+        print(f"   via resolver")
+    else:
+        print(f"   via Keychain `{canonical}`")
+
+    print(f"3. ping {b.synapse_url}")
+    try:
+        req = urllib.request.Request(
+            b.synapse_url + "/",
+            headers={"authorization": f"Bearer {b.token}"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            print(f"   ✅ {r.status}")
+    except Exception as e:
+        print(f"   ❌ {e}")
+        return 1
+
+    print(f"4. intent: synapse.brief.fetch")
+    try:
+        data = call_intent(b, "synapse.brief.fetch", {"project_id": b.project_id})
+        briefs = data.get("briefs", []) if isinstance(data, dict) else []
+        print(f"   ✅ {len(briefs)} brief(s) returned")
+    except SystemExit as e:
+        print(f"   ❌ {e}")
+        return 1
+
+    print()
+    print("🎉 all green — your binding works end-to-end")
+    return 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Runbook helpers — checkin / fact / learning / artifact / whoami / fleet / etc.
+# Each resolves the binding from $PWD; bd_id and target_objective_id come from the
+# active session (session-start) unless overridden by a flag.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _session_get(key: str, explicit=None):
+    if explicit:
+        return explicit
+    st = _load_session()
+    return st.get(key) if st else None
+
+
+def _upload_artifact(b: Binding, path: str, description: str | None, bd_id: str | None) -> str:
+    """artifact.upload a local file, return its artifact_id. Satisfies the runbook's
+    evidence requirement for medium/high facts and learnings."""
+    p = pathlib.Path(path).expanduser()
+    if not p.is_file():
+        raise SystemExit(f"evidence file not found: {p}")
+    payload: dict[str, Any] = {
+        "project_id": b.project_id,
+        "mime_type": mimetypes.guess_type(str(p))[0] or "application/octet-stream",
+        "content_base64": base64.b64encode(p.read_bytes()).decode(),
+        "filename": p.name,
+    }
+    if description:
+        payload["description"] = description
+    if bd_id:
+        payload["bd_id"] = bd_id
+    res = call_intent(b, "synapse.artifact.upload", payload)
+    aid = res.get("artifact_id")
+    if not aid:
+        raise SystemExit(f"artifact.upload returned no artifact_id: {res}")
+    return aid
+
+
+def cmd_checkin(args) -> int:
+    b = find_binding(pathlib.Path.cwd())
+    bd = _session_get("bd_id", args.bd)
+    if not bd:
+        raise SystemExit("no active workflow — run `synapse-cli session-start` first, or pass --bd <id>")
+    payload: dict[str, Any] = {"project_id": b.project_id, "bd_id": bd, "status": args.status}
+    if args.task:
+        payload["current_task"] = args.task
+    if args.progress:
+        payload["progress"] = args.progress
+    obj = _session_get("target_objective_id", args.objective)
+    if obj:
+        payload["target_objective_id"] = obj
+    call_intent(b, "synapse.checkin", payload)
+    print(f"🧠 checkin [{args.status}] on {bd}", file=sys.stderr)
+    return 0
+
+
+def cmd_fact(args) -> int:
+    b = find_binding(pathlib.Path.cwd())
+    bd = _session_get("bd_id", args.bd)
+    if args.confidence in ("medium", "high") and not args.evidence:
+        raise SystemExit(
+            f"confidence={args.confidence} requires --evidence <file>; the platform rejects "
+            f"medium/high facts without an evidence_artifact_id."
+        )
+    fact: dict[str, Any] = {"claim": args.claim, "confidence": args.confidence}
+    if args.evidence:
+        fact["evidence_artifact_id"] = _upload_artifact(b, args.evidence, args.claim[:120], bd)
+    payload: dict[str, Any] = {"project_id": b.project_id, "facts": [fact]}
+    if bd:
+        payload["bd_id"] = bd
+    print(json.dumps(call_intent(b, "synapse.fact.record", payload), indent=2))
+    return 0
+
+
+def cmd_learning(args) -> int:
+    b = find_binding(pathlib.Path.cwd())
+    bd = _session_get("bd_id", args.bd)
+    if args.confidence in ("medium", "high") and not (args.evidence and args.non_obvious):
+        raise SystemExit(
+            f"confidence={args.confidence} learnings require BOTH --evidence <file> and "
+            f"--non-obvious <why this isn't obvious>."
+        )
+    learning: dict[str, Any] = {
+        "claim": args.claim, "applies_to": args.applies_to, "confidence": args.confidence,
+    }
+    if args.non_obvious:
+        learning["non_obvious_marker"] = args.non_obvious
+    if args.evidence:
+        learning["evidence_artifact_id"] = _upload_artifact(b, args.evidence, args.claim[:120], bd)
+    payload: dict[str, Any] = {"project_id": b.project_id, "learnings": [learning]}
+    if bd:
+        payload["bd_id"] = bd
+    print(json.dumps(call_intent(b, "synapse.learning.record", payload), indent=2))
+    return 0
+
+
+def cmd_artifact(args) -> int:
+    b = find_binding(pathlib.Path.cwd())
+    print(_upload_artifact(b, args.file, args.description, _session_get("bd_id", args.bd)))
+    return 0
+
+
+def cmd_whoami(args) -> int:
+    b = find_binding(pathlib.Path.cwd())
+    data = call_intent(b, "synapse.agent.directory", {"limit": 1})
+    print(json.dumps(data.get("caller") or {}, indent=2))
+    return 0
+
+
+def cmd_fleet(args) -> int:
+    b = find_binding(pathlib.Path.cwd())
+    payload: dict[str, Any] = {
+        "team_id": args.team or b.team_id,
+        "include_platform": args.include_platform,
+        "limit": args.limit,
+    }
+    if args.capability:
+        payload["capability"] = args.capability
+    if args.status:
+        payload["status"] = args.status
+    payload = {k: v for k, v in payload.items() if v is not None}
+    data = call_intent(b, "synapse.agent.directory", payload)
+    agents = data.get("agents") or []
+    if args.match:
+        agents = [a for a in agents
+                  if args.match in (a.get("id") or "") or args.match in (a.get("display_name") or "")]
+    for a in agents:
+        caps = ",".join(a.get("declared_capabilities") or [])
+        print(f"{(a.get('status') or '?'):8} {(a.get('id') or ''):46} {caps}")
+    scope = payload.get("team_id", "(all teams)")
+    suffix = f" matching '{args.match}'" if args.match else ""
+    print(f"— {len(agents)} agent(s){suffix} on {scope}", file=sys.stderr)
+    return 0
+
+
+def cmd_question(args) -> int:
+    b = find_binding(pathlib.Path.cwd())
+    payload: dict[str, Any] = {"project_id": b.project_id, "subject": args.subject, "body": args.body}
+    if args.to_agent:
+        payload["to_agent_id"] = args.to_agent
+    if args.to_team:
+        payload["to_team_id"] = args.to_team
+    if args.urgency:
+        payload["urgency"] = args.urgency
+    bd = _session_get("bd_id", args.bd)
+    if bd:
+        payload["bd_id"] = bd
+    print(json.dumps(call_intent(b, "synapse.question.ask", payload), indent=2))
+    return 0
+
+
+def cmd_milestone(args) -> int:
+    b = find_binding(pathlib.Path.cwd())
+    bd = _session_get("bd_id", args.bd)
+    payload: dict[str, Any] = {"milestone_id": args.milestone_id, "claim": args.claim}
+    if args.confidence:
+        payload["confidence"] = args.confidence
+    if args.evidence:
+        payload["evidence_artifact_id"] = _upload_artifact(b, args.evidence, args.claim[:120], bd)
+    if bd:
+        payload["bd_id"] = bd
+    print(json.dumps(call_intent(b, "synapse.milestone.achieve", payload), indent=2))
+    return 0
+
+
+def cmd_kr(args) -> int:
+    b = find_binding(pathlib.Path.cwd())
+    payload: dict[str, Any] = {"milestone_id": args.milestone_id, "metric_current": args.value}
+    bd = _session_get("bd_id", args.bd)
+    if bd:
+        payload["bd_id"] = bd
+    print(json.dumps(call_intent(b, "synapse.key_result.update", payload), indent=2))
+    return 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI plumbing
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(prog="synapse-cli", description=__doc__.split("\n", 2)[1])
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    ss = sub.add_parser("session-start", help="Bind, fetch briefs, create workflow run")
+    ss.add_argument("--workflow-class", default="agent-session")
+    ss.add_argument("--title", default=None)
+    ss.add_argument("--objective", default=None,
+                    help="objective_id to bind this run's workflow + checkins to "
+                         "(default: the project's sole active OKR; errors if >1)")
+    ss.add_argument("--print-env", action="store_true", help="emit `export FOO=…` lines for shells")
+    ss.set_defaults(func=cmd_session_start)
+
+    se = sub.add_parser("session-end", help="Close active workflow run")
+    se.add_argument("--status", choices=["complete", "failed"], default="complete")
+    se.add_argument("--note", default=None)
+    se.set_defaults(func=cmd_session_end)
+
+    ii = sub.add_parser("intent", help="Call any intent by name with JSON payload")
+    ii.add_argument("name")
+    ii.add_argument("--payload", "-p", default=None, help="JSON payload (string)")
+    ii.add_argument("--no-thread-bd", action="store_true", help="don't auto-inject bd_id from session state")
+    ii.add_argument("--no-thread-project", action="store_true", help="don't auto-inject project_id from the binding")
+    ii.set_defaults(func=cmd_intent)
+
+    bn = sub.add_parser("bind", help="Print the resolved binding for $PWD (or --init to scaffold one)")
+    bn.add_argument("--init", action="store_true", help="scaffold .agent/synapse.yaml in the current repo")
+    bn.add_argument("--project", help="[--init] project id (e.g. project.signal or just 'signal')")
+    bn.add_argument("--team", help="[--init] team id (default team.ai-coe)")
+    bn.add_argument("--agent", action="append",
+                    help="[--init] agent id, repeatable; first one with a resolvable token wins")
+    bn.add_argument("--synapse-url", dest="synapse_url", help="[--init] override Synapse URL")
+    bn.add_argument("--force", action="store_true", help="[--init] overwrite an existing binding")
+    bn.set_defaults(func=cmd_bind)
+
+    rd = sub.add_parser("redeem", help="Redeem an enrollment code into Keychain")
+    rd.add_argument("code")
+    rd.add_argument("--display-name", required=True,
+                    help="Agent display_name (e.g. 'signal-junior'). Synapse derives agent_id as 'agent.<display_name>'.")
+    rd.add_argument("--capabilities", nargs="*", default=None,
+                    help="Optional declared_capabilities, space-separated (e.g. coder evaluator)")
+    rd.add_argument("--project", default=None,
+                    help="Optional fallback project_id if server response omits it.")
+    rd.set_defaults(func=cmd_redeem)
+
+    kc = sub.add_parser("keychain", help="Inspect/set Keychain entries")
+    kc.add_argument("action", choices=["list", "get", "set"])
+    kc.add_argument("name", nargs="?")
+    kc.add_argument("value", nargs="?")
+    kc.set_defaults(func=cmd_keychain)
+
+    dr = sub.add_parser("doctor", help="End-to-end sanity check")
+    dr.set_defaults(func=cmd_doctor)
+
+    ck = sub.add_parser("checkin", help="Check in on the active workflow")
+    ck.add_argument("status", choices=["start", "progress", "blocked", "complete", "failed"])
+    ck.add_argument("--task", default=None, help="current_task summary")
+    ck.add_argument("--progress", action="append", help="a progress note (repeatable)")
+    ck.add_argument("--objective", default=None, help="target_objective_id (default: from session)")
+    ck.add_argument("--bd", default=None, help="workflow bd_id (default: from session)")
+    ck.set_defaults(func=cmd_checkin)
+
+    fa = sub.add_parser("fact", help="Record a fact (uploads evidence first for medium/high)")
+    fa.add_argument("claim")
+    fa.add_argument("--confidence", choices=["low", "medium", "high"], default="low")
+    fa.add_argument("--evidence", default=None, help="evidence file path (required for medium/high)")
+    fa.add_argument("--bd", default=None)
+    fa.set_defaults(func=cmd_fact)
+
+    ln = sub.add_parser("learning", help="Record a reusable learning")
+    ln.add_argument("claim")
+    ln.add_argument("--applies-to", dest="applies_to", nargs="+", required=True, help="domains it applies to")
+    ln.add_argument("--confidence", choices=["low", "medium", "high"], default="low")
+    ln.add_argument("--non-obvious", dest="non_obvious", default=None, help="why it isn't obvious (required for medium/high)")
+    ln.add_argument("--evidence", default=None, help="evidence file path (required for medium/high)")
+    ln.add_argument("--bd", default=None)
+    ln.set_defaults(func=cmd_learning)
+
+    ar = sub.add_parser("artifact", help="Upload a file as an artifact; prints its artifact_id")
+    ar.add_argument("file")
+    ar.add_argument("--description", default=None)
+    ar.add_argument("--bd", default=None)
+    ar.set_defaults(func=cmd_artifact)
+
+    wai = sub.add_parser("whoami", help="Print this binding's agent identity and scopes")
+    wai.set_defaults(func=cmd_whoami)
+
+    fl = sub.add_parser("fleet", help="List agents on a team (default: this binding's team)")
+    fl.add_argument("--team", default=None, help="team_id (default: the binding's team)")
+    fl.add_argument("--match", default=None, help="substring filter on agent id/display_name (e.g. a naming suffix)")
+    fl.add_argument("--capability", default=None, help="filter by a declared capability")
+    fl.add_argument("--status", choices=["active", "archived"], default=None)
+    fl.add_argument("--include-platform", dest="include_platform", action="store_true",
+                    help="include human/platform accounts (default: hide them)")
+    fl.add_argument("--limit", type=int, default=200)
+    fl.set_defaults(func=cmd_fleet)
+
+    qa = sub.add_parser("question", help="Ask the operator (or another agent) a question")
+    qa.add_argument("--subject", required=True)
+    qa.add_argument("--body", required=True)
+    qa.add_argument("--to-agent", dest="to_agent", default=None)
+    qa.add_argument("--to-team", dest="to_team", default=None)
+    qa.add_argument("--urgency", choices=["low", "medium", "high"], default=None)
+    qa.add_argument("--bd", default=None)
+    qa.set_defaults(func=cmd_question)
+
+    ms = sub.add_parser("milestone", help="Mark an OKR milestone achieved")
+    ms.add_argument("milestone_id")
+    ms.add_argument("--claim", required=True)
+    ms.add_argument("--evidence", default=None)
+    ms.add_argument("--confidence", choices=["low", "medium", "high"], default=None)
+    ms.add_argument("--bd", default=None)
+    ms.set_defaults(func=cmd_milestone)
+
+    krp = sub.add_parser("kr", help="Update a numeric key-result metric")
+    krp.add_argument("milestone_id")
+    krp.add_argument("value", type=float)
+    krp.add_argument("--bd", default=None)
+    krp.set_defaults(func=cmd_kr)
+
+    args = p.parse_args(argv)
+    try:
+        return args.func(args)
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"synapse-cli error: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
