@@ -1,6 +1,9 @@
 {
-  "name": "synapse-cli",
+  "name": "@dp-pcs/synapse-cli",
   "version": "0.2.0",
+  "publishConfig": {
+    "access": "public"
+  },
   "description": "Thin client for the Synapse organizational-memory API — bind a repo to an agent identity, run OKR-bound workflows, and report work (checkins, facts, learnings, artifacts) back to Synapse.",
   "bin": {
     "synapse-cli": "bin/synapse-cli"
