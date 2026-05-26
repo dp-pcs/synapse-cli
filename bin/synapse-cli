@@ -44,6 +44,11 @@ try:
 except ImportError:
     yaml = None
 
+__version__ = "0.2.2"
+# Sent on every request so the server can attribute calls (esp. enrollment) to
+# this client. Header-only on purpose: it survives strict-schema intents that
+# would 400 an unknown body field, and lets Synapse count "enrolled via CLI".
+USER_AGENT = f"synapse-cli/{__version__}"
 DEFAULT_SYNAPSE_URL = "https://cnu.synapse-os.ai"
 REGISTRY_PATH = pathlib.Path.home() / ".config" / "synapse" / "registry.yaml"
 SESSION_STATE_DIR = pathlib.Path.home() / ".cache" / "synapse"
@@ -312,6 +317,7 @@ def call_intent(b: Binding, intent: str, payload: dict | None = None, *, retries
             headers={
                 "authorization": f"Bearer {b.token}",
                 "content-type": "application/json",
+                "user-agent": USER_AGENT,
             },
         )
         try:
@@ -346,13 +352,19 @@ def call_intent(b: Binding, intent: str, payload: dict | None = None, *, retries
         if status == 400:
             detail = envelope.get("detail")
             fe = detail.get("field_errors") if isinstance(detail, dict) else None
+            msg = envelope.get("error") or envelope.get("message")
+            # Some 400s carry the reason in `error` and leave `detail` empty — fall back to
+            # the whole envelope so the operator always sees what the server actually rejected.
+            body = fe or detail or envelope
             raise SystemExit(
                 f"{intent}: 400 — schema validation failed. Fix the payload (do not retry unchanged):\n"
-                f"{json.dumps(fe or detail, indent=2)}"
+                + (f"error: {msg}\n" if msg else "")
+                + json.dumps(body, indent=2)
             )
         if status in RETRYABLE_STATUS:
             raise SystemExit(f"{intent}: {status} after {retries} retries. On persistent platform "
-                             f"failure, file synapse-cli feedback (category platform-bug).")
+                             f"failure, run: synapse-cli feedback --category bug --severity high "
+                             f"--title '...' --body '...' --related-intent {intent}")
         if not envelope.get("ok"):
             raise SystemExit(
                 f"{intent} failed: {envelope.get('error')}\n"
@@ -672,7 +684,7 @@ def cmd_redeem(args) -> int:
     url = f"{DEFAULT_SYNAPSE_URL}/v1/intent/synapse.agent.enroll"
     req = urllib.request.Request(
         url, data=json.dumps(payload).encode(), method="POST",
-        headers={"content-type": "application/json"},
+        headers={"content-type": "application/json", "user-agent": USER_AGENT},
     )
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
@@ -759,7 +771,7 @@ def cmd_doctor(args) -> int:
     try:
         req = urllib.request.Request(
             b.synapse_url + "/",
-            headers={"authorization": f"Bearer {b.token}"},
+            headers={"authorization": f"Bearer {b.token}", "user-agent": USER_AGENT},
         )
         with urllib.request.urlopen(req, timeout=10) as r:
             print(f"   ✅ {r.status}")
@@ -930,6 +942,30 @@ def cmd_question(args) -> int:
     return 0
 
 
+def cmd_feedback(args) -> int:
+    b = find_binding(pathlib.Path.cwd())
+    bd = _session_get("bd_id", args.bd)
+    if not (3 <= len(args.title) <= 200):
+        raise SystemExit("--title must be 3-200 characters")
+    if len(args.body) < 50:
+        raise SystemExit("--body must be at least 50 characters — state what's wrong and how to reproduce it")
+    payload: dict[str, Any] = {
+        "project_id": b.project_id,
+        "category": args.category,
+        "severity": args.severity,
+        "title": args.title,
+        "body": args.body,
+    }
+    if args.related_intent:
+        payload["related_intent"] = args.related_intent
+    if args.evidence:
+        payload["reproduction_artifact_id"] = _upload_artifact(b, args.evidence, args.title[:120], bd)
+    if bd:
+        payload["bd_id"] = bd
+    print(json.dumps(call_intent(b, "synapse.feedback.submit", payload), indent=2))
+    return 0
+
+
 def cmd_milestone(args) -> int:
     b = find_binding(pathlib.Path.cwd())
     bd = _session_get("bd_id", args.bd)
@@ -1063,6 +1099,19 @@ def main(argv: list[str] | None = None) -> int:
     qa.add_argument("--urgency", choices=["low", "medium", "high"], default=None)
     qa.add_argument("--bd", default=None)
     qa.set_defaults(func=cmd_question)
+
+    fb = sub.add_parser("feedback", help="Submit platform/docs feedback (bug, docs-gap, error-message, ...)")
+    fb.add_argument("--category", required=True,
+                    choices=["bug", "docs-gap", "intent-request", "error-message",
+                             "performance", "contract-conflict", "ux", "other"])
+    fb.add_argument("--title", required=True, help="3-200 chars")
+    fb.add_argument("--body", required=True, help="min 50 chars — what's wrong + how to reproduce")
+    fb.add_argument("--severity", choices=["low", "medium", "high"], default="medium")
+    fb.add_argument("--related-intent", dest="related_intent", default=None,
+                    help="the intent this is about, e.g. synapse.fact.record")
+    fb.add_argument("--evidence", default=None, help="file to upload as reproduction_artifact_id")
+    fb.add_argument("--bd", default=None)
+    fb.set_defaults(func=cmd_feedback)
 
     ms = sub.add_parser("milestone", help="Mark an OKR milestone achieved")
     ms.add_argument("milestone_id")

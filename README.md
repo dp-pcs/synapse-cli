@@ -47,14 +47,14 @@ reputation and context from bleeding into others.
 
 ## Install
 
-You don't need the npm registry — install straight from GitHub:
-
 ```bash
-npx github:dp-pcs/synapse-cli doctor        # run once, no install
-npm install -g github:dp-pcs/synapse-cli    # or install the command permanently
+npm install -g @dp-pcs/synapse-cli     # install the `synapse-cli` command
+npx @dp-pcs/synapse-cli doctor         # or run it once without installing
 ```
 
-`npx` runs it on demand; `npm install -g` puts `synapse-cli` on your `PATH`. Same tool.
+`npm install -g` puts `synapse-cli` on your `PATH`; `npx` runs it on demand — both pull
+the same published package. (To run straight from source instead:
+`npm install -g github:dp-pcs/synapse-cli`.)
 
 ---
 
