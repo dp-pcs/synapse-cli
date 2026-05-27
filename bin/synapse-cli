@@ -44,7 +44,7 @@ try:
 except ImportError:
     yaml = None
 
-__version__ = "0.2.2"
+__version__ = "0.3.0"
 # Sent on every request so the server can attribute calls (esp. enrollment) to
 # this client. Header-only on purpose: it survives strict-schema intents that
 # would 400 an unknown body field, and lets Synapse count "enrolled via CLI".
@@ -427,20 +427,71 @@ def _resolve_objective(args, active_okrs: list) -> str | None:
     return None
 
 
+def _surface_briefs(b: Binding, briefs: list) -> None:
+    """APPLY briefs, THEN ack. Acking a brief the agent never read is a false signal of
+    compliance — so write every brief BODY to a standing-instructions file and print it to
+    stderr (which the agent sees in this run's output) BEFORE acking. Briefs are operator
+    instructions that outrank default behavior, so this is a trusted-operator channel only."""
+    if not briefs:
+        return
+    SESSION_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    si_path = SESSION_STATE_DIR / "standing-instructions.md"
+    lines = ["# STANDING INSTRUCTIONS FROM OPERATOR",
+             "# Fetched at session-start. These outrank your default behavior for this run.", ""]
+    print("📬 STANDING INSTRUCTIONS — read and apply before you act this run:", file=sys.stderr)
+    for brief in briefs:
+        title = brief.get("title", "<no title>")
+        body = brief.get("body", "") or ""
+        lines += [f"## {title}", "", body, ""]
+        print(f"\n── {title} ──\n{body}", file=sys.stderr)
+    si_path.write_text("\n".join(lines))
+    print(f"\n(standing instructions also written to {si_path})", file=sys.stderr)
+    # Ack ONLY after the body has been surfaced — never ack a brief the agent hasn't seen.
+    for brief in briefs:
+        bid = brief.get("id")
+        if bid:
+            call_intent(b, "synapse.brief.ack", {"brief_id": bid})
+
+
+def _surface_learnings(b: Binding) -> None:
+    """Read half of the loop: pull recent org learnings (incl. cross-silo, so one agent
+    benefits from another's lessons) and surface them so the agent reuses what's already
+    been learned. Best-effort — never fail session-start over this."""
+    try:
+        data = call_intent(b, "synapse.learning.query",
+                           {"project_id": b.project_id, "cross_silo": True,
+                            "status": "active", "limit": 15})
+    except SystemExit as e:
+        print(f"   (learnings unavailable: {e})", file=sys.stderr)
+        return
+    learnings = data.get("learnings", []) if isinstance(data, dict) else []
+    if not learnings:
+        return
+    SESSION_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    lpath = SESSION_STATE_DIR / "learnings.md"
+    out = ["# RELEVANT LEARNINGS — reuse these; don't re-derive or repeat a known mistake", ""]
+    print(f"🧠 {len(learnings)} learning(s) to apply before you act:", file=sys.stderr)
+    for L in learnings:
+        claim = L.get("claim", "")
+        applies = ",".join(L.get("applies_to") or [])
+        lid = L.get("id", "")
+        out.append(f"- {claim}" + (f"  ⟨{applies}⟩" if applies else "") + (f"  ({lid})" if lid else ""))
+        print(f"   • {claim}" + (f"  ⟨{applies}⟩" if applies else ""), file=sys.stderr)
+    lpath.write_text("\n".join(out))
+    print(f"   (also written to {lpath} — cite the ones you apply in your checkin)", file=sys.stderr)
+
+
 def cmd_session_start(args) -> int:
     b = find_binding(pathlib.Path.cwd())
 
-    # 1. Fetch & ack briefs; capture active OKRs (brief.fetch → {briefs, active_okrs})
+    # 1. Fetch briefs + active OKRs, then run the READ half of the loop: APPLY briefs
+    #    (surface bodies before acking) and pull recent learnings so the agent reuses org
+    #    knowledge instead of re-deriving it. See _surface_briefs / _surface_learnings.
     briefs_data = call_intent(b, "synapse.brief.fetch", {"project_id": b.project_id})
     briefs = briefs_data.get("briefs", []) if isinstance(briefs_data, dict) else []
     active_okrs = briefs_data.get("active_okrs", []) if isinstance(briefs_data, dict) else []
-    for brief in briefs:
-        bid = brief.get("id")
-        if not bid:
-            continue
-        # Display briefly to stderr so the agent (and human) see what they're acking
-        print(f"📬 brief: {brief.get('title', '<no title>')}", file=sys.stderr)
-        call_intent(b, "synapse.brief.ack", {"brief_id": bid})
+    _surface_briefs(b, briefs)
+    _surface_learnings(b)
 
     # 2. Resolve the OKR this run binds to (see _resolve_objective for the contract)
     target_objective_id = _resolve_objective(args, active_okrs)
@@ -893,6 +944,45 @@ def cmd_artifact(args) -> int:
     return 0
 
 
+def cmd_learnings(args) -> int:
+    b = find_binding(pathlib.Path.cwd())
+    payload: dict[str, Any] = {"project_id": b.project_id, "status": args.status, "limit": args.limit}
+    if args.applies_to:
+        payload["applies_to"] = args.applies_to
+    if args.cross_silo:
+        payload["cross_silo"] = True
+    data = call_intent(b, "synapse.learning.query", payload)
+    learnings = data.get("learnings", []) if isinstance(data, dict) else []
+    if not learnings:
+        print("no learnings match this query — nothing recorded yet", file=sys.stderr)
+        return 0
+    for L in learnings:
+        claim = L.get("claim", "")
+        applies = ",".join(L.get("applies_to") or [])
+        conf = L.get("confidence", "?")
+        lid = L.get("id", "")
+        print(f"• [{conf}] {claim}" + (f"  ⟨{applies}⟩" if applies else "") + (f"  ({lid})" if lid else ""))
+    print(f"— {len(learnings)} learning(s)", file=sys.stderr)
+    return 0
+
+
+def cmd_facts(args) -> int:
+    b = find_binding(pathlib.Path.cwd())
+    payload: dict[str, Any] = {"project_id": b.project_id, "status": args.status, "limit": args.limit}
+    data = call_intent(b, "synapse.fact.query", payload)
+    facts = data.get("facts", []) if isinstance(data, dict) else []
+    if not facts:
+        print("no facts match this query", file=sys.stderr)
+        return 0
+    for f in facts:
+        claim = f.get("claim", "")
+        conf = f.get("confidence", "?")
+        fid = f.get("id", "")
+        print(f"• [{conf}] {claim}" + (f"  ({fid})" if fid else ""))
+    print(f"— {len(facts)} fact(s)", file=sys.stderr)
+    return 0
+
+
 def cmd_whoami(args) -> int:
     b = find_binding(pathlib.Path.cwd())
     data = call_intent(b, "synapse.agent.directory", {"limit": 1})
@@ -1112,6 +1202,20 @@ def main(argv: list[str] | None = None) -> int:
     fb.add_argument("--evidence", default=None, help="file to upload as reproduction_artifact_id")
     fb.add_argument("--bd", default=None)
     fb.set_defaults(func=cmd_feedback)
+
+    lq = sub.add_parser("learnings", help="Query org learnings — reuse what's been learned BEFORE you act")
+    lq.add_argument("--applies-to", dest="applies_to", nargs="*", default=None,
+                    help="filter to domains, e.g. --applies-to ci security")
+    lq.add_argument("--cross-silo", dest="cross_silo", action="store_true",
+                    help="include other projects' learnings (cross-agent reuse)")
+    lq.add_argument("--status", choices=["active", "superseded", "disputed"], default="active")
+    lq.add_argument("--limit", type=int, default=25)
+    lq.set_defaults(func=cmd_learnings)
+
+    ftq = sub.add_parser("facts", help="Query recorded facts for this project")
+    ftq.add_argument("--status", choices=["active", "superseded", "disputed"], default="active")
+    ftq.add_argument("--limit", type=int, default=50)
+    ftq.set_defaults(func=cmd_facts)
 
     ms = sub.add_parser("milestone", help="Mark an OKR milestone achieved")
     ms.add_argument("milestone_id")
