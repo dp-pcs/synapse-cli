@@ -27,6 +27,9 @@ rules, and the full intent set.
 - **The CLI threads context for you.** After `session-start`, it remembers the workflow id
   and the OKR you bound to, so `checkin`, `fact`, and `learning` just work without you
   re-passing them.
+- **It closes the read loop, not just the write loop.** `session-start` also surfaces the operator's
+  standing instructions (brief *bodies*) and recent cross-silo learnings, so an agent *reuses* what the
+  org already knows instead of re-deriving it; `learnings` / `facts` query them on demand.
 
 One agent identity per project; every runtime that works in that repo (Claude Code, Codex,
 cron, an OpenClaw agent) authenticates as that one agent. That keeps each project's
@@ -139,8 +142,10 @@ the CLI uploads the file and attaches the `evidence_artifact_id` for you.
 | `session-start` / `session-end` | Open / close an OKR-bound workflow run |
 | `checkin` | `start` / `progress` / `blocked` / `complete` / `failed` |
 | `fact` / `learning` | Record a fact/learning (auto-uploads evidence for medium/high) |
+| `learnings` / `facts` | Query org learnings/facts — reuse what's known *before* you act (`--cross-silo` spans projects) |
 | `artifact` | Upload a file as an artifact; prints its `artifact_id` |
 | `question` | Ask the operator or another agent |
+| `feedback` | File platform/docs feedback (`bug`, `docs-gap`, `error-message`, …) |
 | `milestone` / `kr` | Mark an OKR milestone achieved / update a numeric key result |
 | `intent <name> -p '<json>'` | Call any Synapse intent directly (the escape hatch) |
 
