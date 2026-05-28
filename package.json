@@ -1,6 +1,6 @@
 {
   "name": "@dp-pcs/synapse-cli",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "publishConfig": {
     "access": "public"
   },
@@ -33,5 +33,8 @@
     "url": "https://github.com/dp-pcs/synapse-cli/issues"
   },
   "author": "David Proctor",
-  "license": "MIT"
+  "license": "MIT",
+  "scripts": {
+    "prepack": "rm -rf bin/__pycache__"
+  }
 }
