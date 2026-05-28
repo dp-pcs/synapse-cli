@@ -44,7 +44,7 @@ try:
 except ImportError:
     yaml = None
 
-__version__ = "0.3.4"
+__version__ = "0.3.5"
 # Sent on every request so the server can attribute calls (esp. enrollment) to
 # this client. Header-only on purpose: it survives strict-schema intents that
 # would 400 an unknown body field, and lets Synapse count "enrolled via CLI".
@@ -915,8 +915,49 @@ def cmd_checkin(args) -> int:
     obj = _session_get("target_objective_id", args.objective)
     if obj:
         payload["target_objective_id"] = obj
-    call_intent(b, "synapse.checkin", payload)
-    print(f"🧠 checkin [{args.status}] on {bd}", file=sys.stderr)
+    if args.used_learning:
+        # Closes the retrieve-before-act loop. The server-side field is `used_learnings`
+        # (plural), but the CLI accepts repeated `--used-learning <id>` for clarity.
+        # Hidden-by-design until feedback b2429099 surfaces it; see also `apply-learning`.
+        payload["used_learnings"] = args.used_learning
+    data = call_intent(b, "synapse.checkin", payload)
+    recorded = data.get("recorded_uses") if isinstance(data, dict) else None
+    suffix = f" (recorded_uses: {recorded})" if recorded else ""
+    print(f"🧠 checkin [{args.status}] on {bd}{suffix}", file=sys.stderr)
+    return 0
+
+
+def cmd_apply_learning(args) -> int:
+    """Record that one or more learnings were applied to current work. Closes the
+    retrieve-before-act loop so other agents can see what's actually being reused.
+
+    Why a dedicated subcommand: until feedback b2429099 is addressed, used_learnings
+    rides on the synapse.checkin payload as a sub-field rather than a first-class
+    intent — which means agents probing the API surface won't find it via --help or
+    OpenAPI. This wraps the asymmetry so the closure path is discoverable like any
+    other learning operation."""
+    b = find_binding(pathlib.Path.cwd())
+    bd = _session_get("bd_id", args.bd)
+    if not bd:
+        raise SystemExit("no active workflow — run `synapse-cli session-start` first, or pass --bd <id>")
+    payload: dict[str, Any] = {
+        "project_id": b.project_id,
+        "bd_id": bd,
+        "status": "progress",
+        "used_learnings": args.learning_id,
+    }
+    if args.note:
+        payload["progress"] = [args.note]
+    obj = _session_get("target_objective_id", args.objective)
+    if obj:
+        payload["target_objective_id"] = obj
+    data = call_intent(b, "synapse.checkin", payload)
+    recorded = data.get("recorded_uses") if isinstance(data, dict) else None
+    ids = ", ".join(args.learning_id)
+    if recorded is not None:
+        print(f"🧠 applied {recorded} learning(s) on {bd}: {ids}", file=sys.stderr)
+    else:
+        print(f"🧠 sent {len(args.learning_id)} learning(s) on {bd}: {ids}", file=sys.stderr)
     return 0
 
 
@@ -1175,6 +1216,10 @@ def main(argv: list[str] | None = None) -> int:
     ck.add_argument("--progress", action="append", help="a progress note (repeatable)")
     ck.add_argument("--objective", default=None, help="target_objective_id (default: from session)")
     ck.add_argument("--bd", default=None, help="workflow bd_id (default: from session)")
+    ck.add_argument("--used-learning", dest="used_learning", action="append", default=None,
+                    metavar="LEARNING_ID",
+                    help="learning_id you applied to this work (repeatable). "
+                         "Also available as the dedicated `apply-learning` subcommand.")
     ck.set_defaults(func=cmd_checkin)
 
     fa = sub.add_parser("fact", help="Record a fact (uploads evidence first for medium/high)")
@@ -1198,6 +1243,18 @@ def main(argv: list[str] | None = None) -> int:
     ar.add_argument("--description", default=None)
     ar.add_argument("--bd", default=None)
     ar.set_defaults(func=cmd_artifact)
+
+    al = sub.add_parser("apply-learning",
+                        help="Record one or more learnings as applied (closes the retrieve-before-act loop)")
+    al.add_argument("learning_id", nargs="+", metavar="LEARNING_ID",
+                    help="learning IDs you applied to current work")
+    al.add_argument("--note", default=None,
+                    help="optional progress note explaining how you applied it")
+    al.add_argument("--objective", default=None,
+                    help="target_objective_id (default: from session)")
+    al.add_argument("--bd", default=None,
+                    help="workflow bd_id (default: from session)")
+    al.set_defaults(func=cmd_apply_learning)
 
     wai = sub.add_parser("whoami", help="Print this binding's agent identity and scopes")
     wai.set_defaults(func=cmd_whoami)
