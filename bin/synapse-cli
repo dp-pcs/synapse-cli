@@ -44,7 +44,7 @@ try:
 except ImportError:
     yaml = None
 
-__version__ = "0.3.0"
+__version__ = "0.3.2"
 # Sent on every request so the server can attribute calls (esp. enrollment) to
 # this client. Header-only on purpose: it survives strict-schema intents that
 # would 400 an unknown body field, and lets Synapse count "enrolled via CLI".
@@ -457,12 +457,27 @@ def _surface_learnings(b: Binding) -> None:
     """Read half of the loop: pull recent org learnings (incl. cross-silo, so one agent
     benefits from another's lessons) and surface them so the agent reuses what's already
     been learned. Best-effort — never fail session-start over this."""
+    # The server rejects cross-silo queries that have no applies_to filter (400). Default
+    # to the bound project (+ team if known) so the agent picks up: learnings tagged for
+    # this project specifically (filed by any agent), and team-scoped learnings (general
+    # patterns the operator tagged for the whole team). The manual `synapse-cli learnings`
+    # command lets callers override with --applies-to for ad-hoc domain queries.
+    applies_filter = [b.project_id]
+    if b.team_id:
+        applies_filter.append(b.team_id)
+    payload = {"project_id": b.project_id,
+               "applies_to": applies_filter,
+               "cross_silo": True,
+               "status": "active",
+               "limit": 15}
     try:
-        data = call_intent(b, "synapse.learning.query",
-                           {"project_id": b.project_id, "cross_silo": True,
-                            "status": "active", "limit": 15})
+        data = call_intent(b, "synapse.learning.query", payload)
     except SystemExit as e:
-        print(f"   (learnings unavailable: {e})", file=sys.stderr)
+        # call_intent formats a multi-line error envelope on 400 — preserve it so the
+        # next regression isn't silent like the missing-applies_to bug was.
+        print("⚠️  learnings query failed — read-loop step 1 (retrieve-before-act) "
+              "is degraded for this session:", file=sys.stderr)
+        print(str(e), file=sys.stderr)
         return
     learnings = data.get("learnings", []) if isinstance(data, dict) else []
     if not learnings:
@@ -951,6 +966,14 @@ def cmd_learnings(args) -> int:
         payload["applies_to"] = args.applies_to
     if args.cross_silo:
         payload["cross_silo"] = True
+        # Server rejects cross-silo with no applies_to (400). Default to the bound
+        # project (+ team) so `synapse-cli learnings --cross-silo` Just Works without
+        # forcing the caller to specify --applies-to.
+        if not args.applies_to:
+            applies_filter = [b.project_id]
+            if b.team_id:
+                applies_filter.append(b.team_id)
+            payload["applies_to"] = applies_filter
     data = call_intent(b, "synapse.learning.query", payload)
     learnings = data.get("learnings", []) if isinstance(data, dict) else []
     if not learnings:
