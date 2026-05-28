@@ -44,7 +44,7 @@ try:
 except ImportError:
     yaml = None
 
-__version__ = "0.3.3"
+__version__ = "0.3.4"
 # Sent on every request so the server can attribute calls (esp. enrollment) to
 # this client. Header-only on purpose: it survives strict-schema intents that
 # would 400 an unknown body field, and lets Synapse count "enrolled via CLI".
@@ -812,6 +812,13 @@ def cmd_keychain(args) -> int:
 def cmd_doctor(args) -> int:
     print("🩺 synapse-cli doctor")
     print()
+    # Self-diagnose: show which binary is actually running and from where.
+    # Catches the "wrapper at ~/.local/bin/X points at a stale path" failure mode where
+    # `synapse-cli --version` says one thing but the running script is something else.
+    print(f"0. binary: {pathlib.Path(__file__).resolve()}")
+    print(f"   version: {__version__}")
+    print(f"   python:  {sys.executable}")
+    print()
     print(f"1. cwd: {pathlib.Path.cwd()}")
     try:
         b = find_binding(pathlib.Path.cwd())
@@ -1109,6 +1116,7 @@ def cmd_kr(args) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="synapse-cli", description=__doc__.split("\n", 2)[1])
+    p.add_argument("--version", action="version", version=f"synapse-cli {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     ss = sub.add_parser("session-start", help="Bind, fetch briefs, create workflow run")
