@@ -1089,7 +1089,16 @@ def cmd_fleet(args) -> int:
 
 def cmd_question(args) -> int:
     b = find_binding(pathlib.Path.cwd())
-    payload: dict[str, Any] = {"project_id": b.project_id, "subject": args.subject, "body": args.body}
+    # synapse.question.ask (server-side as of 2026-06-10) requires three evidence arrays.
+    # They may be empty, but the fields must be PRESENT — server returns 400 otherwise.
+    payload: dict[str, Any] = {
+        "project_id": b.project_id,
+        "subject": args.subject,
+        "body": args.body,
+        "evidence_artifact_ids": list(args.evidence_artifact or []),
+        "evidence_fact_ids": list(args.evidence_fact or []),
+        "evidence_learning_ids": list(args.evidence_learning or []),
+    }
     if args.to_agent:
         payload["to_agent_id"] = args.to_agent
     if args.to_team:
@@ -1130,9 +1139,13 @@ def cmd_feedback(args) -> int:
 def cmd_milestone(args) -> int:
     b = find_binding(pathlib.Path.cwd())
     bd = _session_get("bd_id", args.bd)
-    payload: dict[str, Any] = {"milestone_id": args.milestone_id, "claim": args.claim}
-    if args.confidence:
-        payload["confidence"] = args.confidence
+    # synapse.milestone.achieve (server-side as of 2026-06-10) requires both claim AND confidence.
+    # We default confidence to "medium" if the caller didn't specify, so the schema is always satisfied.
+    payload: dict[str, Any] = {
+        "milestone_id": args.milestone_id,
+        "claim": args.claim,
+        "confidence": args.confidence or "medium",
+    }
     if args.evidence:
         payload["evidence_artifact_id"] = _upload_artifact(b, args.evidence, args.claim[:120], bd)
     if bd:
@@ -1275,6 +1288,17 @@ def main(argv: list[str] | None = None) -> int:
     qa.add_argument("--to-agent", dest="to_agent", default=None)
     qa.add_argument("--to-team", dest="to_team", default=None)
     qa.add_argument("--urgency", choices=["low", "medium", "high"], default=None)
+    # Evidence arrays — required-but-may-be-empty as of 2026-06-10 server schema.
+    # Pass repeated flags to cite supporting Synapse objects:
+    #   --evidence-artifact <id> --evidence-artifact <id> ...
+    #   --evidence-fact <id> --evidence-fact <id> ...
+    #   --evidence-learning <id> --evidence-learning <id> ...
+    qa.add_argument("--evidence-artifact", dest="evidence_artifact", action="append", default=None,
+                    help="artifact_id to cite as evidence (repeatable)")
+    qa.add_argument("--evidence-fact", dest="evidence_fact", action="append", default=None,
+                    help="fact_id to cite as evidence (repeatable)")
+    qa.add_argument("--evidence-learning", dest="evidence_learning", action="append", default=None,
+                    help="learning_id to cite as evidence (repeatable)")
     qa.add_argument("--bd", default=None)
     qa.set_defaults(func=cmd_question)
 
