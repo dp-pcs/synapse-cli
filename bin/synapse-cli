@@ -44,7 +44,7 @@ try:
 except ImportError:
     yaml = None
 
-__version__ = "0.3.8"
+__version__ = "0.3.9"
 # Sent on every request so the server can attribute calls (esp. enrollment) to
 # this client. Header-only on purpose: it survives strict-schema intents that
 # would 400 an unknown body field, and lets Synapse count "enrolled via CLI".
@@ -902,6 +902,15 @@ def _upload_artifact(b: Binding, path: str, description: str | None, bd_id: str 
     return aid
 
 
+def _wrap_used_learnings(learning_ids: list[str], outcome: str = "applied") -> list[dict]:
+    """Wrap raw learning_id strings into the [{learning_id, outcome}] shape the server
+    requires. The CLI accepts repeated `--used-learning <id>` for clarity; the API
+    requires objects, not bare strings (otherwise 400). Default outcome is 'applied';
+    pass --outcome to override (e.g. tried, succeeded, failed, rejected). Verified
+    string-array form 400s on 2026-06-22; see brief § 4 `synapse.checkin used_learnings`."""
+    return [{"learning_id": lid, "outcome": outcome} for lid in learning_ids]
+
+
 def cmd_checkin(args) -> int:
     b = find_binding(pathlib.Path.cwd())
     bd = _session_get("bd_id", args.bd)
@@ -917,9 +926,9 @@ def cmd_checkin(args) -> int:
         payload["target_objective_id"] = obj
     if args.used_learning:
         # Closes the retrieve-before-act loop. The server-side field is `used_learnings`
-        # (plural), but the CLI accepts repeated `--used-learning <id>` for clarity.
-        # Hidden-by-design until feedback b2429099 surfaces it; see also `apply-learning`.
-        payload["used_learnings"] = args.used_learning
+        # (plural) and requires objects of shape {learning_id, outcome}. CLI accepts
+        # repeated `--used-learning <id>` and wraps for the caller.
+        payload["used_learnings"] = _wrap_used_learnings(args.used_learning, args.outcome or "applied")
     data = call_intent(b, "synapse.checkin", payload)
     recorded = data.get("recorded_uses") if isinstance(data, dict) else None
     suffix = f" (recorded_uses: {recorded})" if recorded else ""
@@ -944,7 +953,7 @@ def cmd_apply_learning(args) -> int:
         "project_id": b.project_id,
         "bd_id": bd,
         "status": "progress",
-        "used_learnings": args.learning_id,
+        "used_learnings": _wrap_used_learnings(args.learning_id, args.outcome or "applied"),
     }
     if args.note:
         payload["progress"] = [args.note]
@@ -1233,6 +1242,9 @@ def main(argv: list[str] | None = None) -> int:
                     metavar="LEARNING_ID",
                     help="learning_id you applied to this work (repeatable). "
                          "Also available as the dedicated `apply-learning` subcommand.")
+    ck.add_argument("--outcome", default=None,
+                    choices=["applied", "tried", "succeeded", "failed", "rejected"],
+                    help="outcome for ALL --used-learning ids passed in this call (default: applied)")
     ck.set_defaults(func=cmd_checkin)
 
     fa = sub.add_parser("fact", help="Record a fact (uploads evidence first for medium/high)")
@@ -1267,6 +1279,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="target_objective_id (default: from session)")
     al.add_argument("--bd", default=None,
                     help="workflow bd_id (default: from session)")
+    al.add_argument("--outcome", default=None,
+                    choices=["applied", "tried", "succeeded", "failed", "rejected"],
+                    help="outcome for ALL learning_ids in this call (default: applied)")
     al.set_defaults(func=cmd_apply_learning)
 
     wai = sub.add_parser("whoami", help="Print this binding's agent identity and scopes")
